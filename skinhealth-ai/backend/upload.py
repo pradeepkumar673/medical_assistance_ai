@@ -2,7 +2,9 @@ import os
 import uuid
 from datetime import datetime
 
+import numpy as np
 import torch
+import torch.nn.functional as F
 import torchvision.transforms as transforms
 from PIL import Image
 from flask import Blueprint, request, jsonify, current_app
@@ -13,6 +15,14 @@ from werkzeug.utils import secure_filename
 
 import timm
 from mongo_db import get_db
+
+try:
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    _HAS_MATPLOTLIB = True
+except ImportError:
+    _HAS_MATPLOTLIB = False
 
 upload_bp = Blueprint('upload', __name__)
 
@@ -67,6 +77,42 @@ def preprocess_image(image_path):
     ])
     image = Image.open(image_path).convert('RGB')
     return transform(image).unsqueeze(0).to(device)
+
+
+def generate_gradcam_heatmap(model, input_tensor, target_class_idx, save_path, size=(300, 300)):
+    """Generate Grad-CAM heatmap and save as image (medical colormap: blue -> green -> yellow -> red)."""
+    if not _HAS_MATPLOTLIB:
+        return None
+    model.eval()
+    input_tensor = input_tensor.clone().detach().requires_grad_(True)
+    try:
+        features = model.forward_features(input_tensor)
+        features.retain_grad()
+        head_fn = getattr(model, 'forward_head', None) or getattr(model, 'head', None)
+        if head_fn is None:
+            return None
+        logits = head_fn(features) if callable(head_fn) else model.fc(features)
+        score = logits[0, target_class_idx]
+        model.zero_grad()
+        score.backward()
+        grad = features.grad
+        if grad is None:
+            return None
+        weights = grad.mean(dim=(2, 3))
+        cam = (weights.unsqueeze(2).unsqueeze(3) * features).sum(1, keepdim=True).clamp(min=0)
+        cam = F.interpolate(cam, size=size, mode='bilinear', align_corners=False)
+        cam = cam[0, 0].detach().cpu().numpy()
+        cam = (cam - cam.min()) / (cam.max() - cam.min() + 1e-8)
+        plt.figure(figsize=(4, 4))
+        plt.imshow(cam, cmap='jet')
+        plt.axis('off')
+        plt.tight_layout(pad=0)
+        plt.savefig(save_path, bbox_inches='tight', pad_inches=0, dpi=100)
+        plt.close()
+        return save_path
+    except Exception as e:
+        print(f"Grad-CAM failed: {e}")
+        return None
 
 
 @upload_bp.route('/predict', methods=['POST'])
@@ -130,6 +176,17 @@ def predict():
     else:
         severity = 'High'
 
+    heatmap_filename = None
+    try:
+        base_name = filename.rsplit('.', 1)[0] if '.' in filename else 'heatmap'
+        candidate = f"heatmap_{uuid.uuid4().hex}_{base_name}.png"
+        heatmap_fullpath = os.path.join(current_app.config['UPLOAD_FOLDER'], candidate)
+        result = generate_gradcam_heatmap(model, input_tensor, predicted.item(), heatmap_fullpath)
+        if result:
+            heatmap_filename = os.path.basename(result)
+    except Exception as e:
+        print(f"Heatmap generation skipped: {e}")
+
     identity = get_current_user_identity()
     if not identity:
         return jsonify({'msg': 'Invalid token'}), 401
@@ -140,7 +197,8 @@ def predict():
         'image_path': unique_filename,
         'prediction': pred_class,
         'severity': severity,
-        'heatmap_path': None,
+        'confidence': confidence,
+        'heatmap_path': heatmap_filename,
         'timestamp': datetime.utcnow(),
     }
     result = db.analyses.insert_one(analysis_doc)
@@ -151,7 +209,7 @@ def predict():
         'severity': severity,
         'confidence': confidence,
         'first_aid': FIRST_AID.get(pred_class, 'No specific advice.'),
-        'heatmap_url': None,
+        'heatmap_url': f'/uploads/{heatmap_filename}' if heatmap_filename else None,
         'image_url': f'/uploads/{unique_filename}'
     })
 
@@ -196,6 +254,7 @@ def get_analysis(analysis_id):
         'image': a.get('image_path'),
         'prediction': a.get('prediction', ''),
         'severity': a.get('severity', ''),
+        'confidence': a.get('confidence'),
         'first_aid': FIRST_AID.get(a.get('prediction'), 'No specific advice.'),
         'heatmap': a.get('heatmap_path'),
     })
