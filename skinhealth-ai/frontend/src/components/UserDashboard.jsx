@@ -1,12 +1,17 @@
 import { useState, useEffect } from 'react';
-import { useAuth } from '../context/AuthContext';
-import api from '../services/api';
-import UploadForm from './UploadForm';
+import { motion } from 'framer-motion';
 import { Link } from 'react-router-dom';
+import api from '../services/api';
 import toast from 'react-hot-toast';
+import UploadZone from './UploadZone';
+
+const SEVERITY_STYLE = {
+  High: 'bg-red-50 border-red-200 text-red-700',
+  Medium: 'bg-amber-50 border-amber-200 text-amber-800',
+  Low: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+};
 
 export default function UserDashboard() {
-  const { user, logout } = useAuth();
   const [analyses, setAnalyses] = useState([]);
 
   useEffect(() => {
@@ -15,34 +20,60 @@ export default function UserDashboard() {
 
   const fetchAnalyses = async () => {
     try {
-      const res = await api.get('/api/analyses'); // We'll add this endpoint later
-      setAnalyses(res.data);
+      const res = await api.get('/api/analyses');
+      setAnalyses(res.data || []);
     } catch (err) {
       toast.error('Failed to load analyses');
     }
   };
 
   return (
-    <div className="container mx-auto p-4">
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-3xl font-bold">User Dashboard</h1>
-        <button onClick={logout} className="bg-red-500 text-white px-4 py-2 rounded">Logout</button>
-      </div>
-      <p className="mb-4">Welcome, {user?.name}!</p>
+    <div className="space-y-10">
+      <motion.section
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+      >
+        <h2 className="font-display text-2xl font-bold text-slate-800 mb-4">New analysis</h2>
+        <UploadZone onUpload={fetchAnalyses} />
+      </motion.section>
 
-      <UploadForm onUpload={fetchAnalyses} />
-
-      <h2 className="text-2xl font-semibold mt-8 mb-4">Past Analyses</h2>
-      <div className="grid gap-4">
-        {analyses.map(a => (
-          <div key={a.id} className="border p-4 rounded shadow">
-            <p><strong>Disease:</strong> {a.prediction}</p>
-            <p><strong>Severity:</strong> {a.severity}</p>
-            <p><strong>Date:</strong> {new Date(a.timestamp).toLocaleString()}</p>
-            <Link to={`/analysis/${a.id}`} className="text-blue-600">View Details</Link>
+      <motion.section
+        initial={{ opacity: 0, y: 12 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ delay: 0.1 }}
+      >
+        <h2 className="font-display text-2xl font-bold text-slate-800 mb-4">Past analyses</h2>
+        {analyses.length === 0 ? (
+          <div className="card-glass p-12 text-center text-slate-500">
+            <p>No analyses yet. Upload an image above to get started.</p>
           </div>
-        ))}
-      </div>
+        ) : (
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            {analyses.map((a, i) => (
+              <motion.div
+                key={a.id}
+                initial={{ opacity: 0, y: 12 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.05 * i }}
+                whileHover={{ y: -2 }}
+              >
+                <Link to={`/analysis/${a.id}`}>
+                  <div className={`card-glass p-5 border ${SEVERITY_STYLE[a.severity] || SEVERITY_STYLE.Low}`}>
+                    <p className="text-xs text-slate-500">
+                      {a.timestamp ? new Date(a.timestamp).toLocaleDateString() : '—'}
+                    </p>
+                    <p className="font-semibold text-slate-800 mt-1">{a.prediction}</p>
+                    <span className={`inline-block mt-2 px-2 py-0.5 rounded-full text-xs font-medium ${SEVERITY_STYLE[a.severity] || SEVERITY_STYLE.Low}`}>
+                      {a.severity}
+                    </span>
+                    <p className="mt-3 text-teal-600 text-sm font-medium">View details →</p>
+                  </div>
+                </Link>
+              </motion.div>
+            ))}
+          </div>
+        )}
+      </motion.section>
     </div>
   );
 }
