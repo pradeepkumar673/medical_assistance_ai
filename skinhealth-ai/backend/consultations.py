@@ -1,162 +1,205 @@
-from flask import Blueprint, request, jsonify, current_app
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from models import db, User, Analysis, Consultation
 from datetime import datetime
-import razorpay
+from bson import ObjectId
+
+from flask import Blueprint, request, jsonify, current_app
+from flask_jwt_extended import jwt_required
+
+from auth import get_current_user_identity
+from mongo_db import get_db
 from email_utils import send_email
-import json
 
 consult_bp = Blueprint('consult', __name__)
 
-# Initialize Razorpay client
 razorpay_client = None
+
 
 def init_razorpay(app):
     global razorpay_client
-    razorpay_client = razorpay.Client(auth=(app.config['RAZORPAY_KEY_ID'], app.config['RAZORPAY_KEY_SECRET']))
+    if app.config.get('RAZORPAY_KEY_ID') and app.config.get('RAZORPAY_KEY_SECRET'):
+        import razorpay
+        razorpay_client = razorpay.Client(auth=(app.config['RAZORPAY_KEY_ID'], app.config['RAZORPAY_KEY_SECRET']))
+    else:
+        razorpay_client = None
+
 
 @consult_bp.route('/doctors', methods=['GET'])
 @jwt_required()
 def get_doctors():
-    doctors = User.query.filter_by(role='doctor').all()
+    db = get_db()
+    doctors = list(db.users.find({'role': 'doctor'}))
     return jsonify([{
-        'id': d.id,
-        'name': d.name,
-        'phone': d.phone,
-        'is_online': d.is_online
+        'id': str(d['_id']),
+        'name': d.get('name', ''),
+        'phone': d.get('phone', ''),
+        'is_online': d.get('is_online', False),
     } for d in doctors])
+
 
 @consult_bp.route('/request', methods=['POST'])
 @jwt_required()
 def request_consultation():
-    data = request.get_json()
-    user_id = get_jwt_identity()['id']
+    data = request.get_json() or {}
+    identity = get_current_user_identity()
+    if not identity:
+        return jsonify({'msg': 'Invalid token'}), 401
+    user_id = identity.get('id')
+    if not user_id:
+        return jsonify({'msg': 'Invalid token'}), 401
     doctor_id = data.get('doctor_id')
     analysis_id = data.get('analysis_id')
-    consult_type = data.get('type')  # chat/call/video
+    consult_type = data.get('type') or 'chat'
 
-    # Validate
-    doctor = User.query.get(doctor_id)
-    if not doctor or doctor.role != 'doctor':
+    db = get_db()
+    doctor = db.users.find_one({'_id': ObjectId(doctor_id)}) if doctor_id else None
+    if not doctor or doctor.get('role') != 'doctor':
         return jsonify({'msg': 'Invalid doctor'}), 400
 
-    analysis = Analysis.query.get(analysis_id)
-    if not analysis or analysis.user_id != user_id:
+    try:
+        aid = ObjectId(analysis_id)
+    except Exception:
+        return jsonify({'msg': 'Invalid analysis'}), 400
+    analysis = db.analyses.find_one({'_id': aid, 'user_id': user_id})
+    if not analysis:
         return jsonify({'msg': 'Invalid analysis'}), 400
 
-    consultation = Consultation(
-        user_id=user_id,
-        doctor_id=doctor_id,
-        analysis_id=analysis_id,
-        type=consult_type,
-        status='pending'
-    )
-    db.session.add(consultation)
-    db.session.commit()
+    doc = {
+        'user_id': user_id,
+        'doctor_id': doctor_id,
+        'analysis_id': analysis_id,
+        'type': consult_type,
+        'status': 'pending',
+        'time_slot': None,
+        'payment_id': None,
+        'created_at': datetime.utcnow(),
+    }
+    result = db.consultations.insert_one(doc)
+    consultation_id = str(result.inserted_id)
 
-    # Send email to doctor
-    user = User.query.get(user_id)
+    user = db.users.find_one({'_id': ObjectId(user_id)})
     subject = "New Consultation Request"
     body = f"""
-    <p>Dear Dr. {doctor.name},</p>
-    <p>You have a new consultation request from {user.name}.</p>
-    <p><strong>Disease:</strong> {analysis.prediction}<br>
-    <strong>Severity:</strong> {analysis.severity}<br>
+    <p>Dear Dr. {doctor.get('name', '')},</p>
+    <p>You have a new consultation request from {user.get('name', '')}.</p>
+    <p><strong>Disease:</strong> {analysis.get('prediction', '')}<br>
+    <strong>Severity:</strong> {analysis.get('severity', '')}<br>
     <strong>Type:</strong> {consult_type}</p>
     <p>Please log in to your dashboard to accept or reject this request.</p>
     """
-    send_email(doctor.email, subject, body)
+    if current_app.config.get('MAIL_USERNAME'):
+        send_email(doctor.get('email', ''), subject, body)
 
-    return jsonify({'consultation_id': consultation.id}), 201
+    return jsonify({'consultation_id': consultation_id}), 201
+
+
+def _serialize_consultation(r, db):
+    user = db.users.find_one({'_id': ObjectId(r['user_id'])}) if r.get('user_id') else None
+    doctor = db.users.find_one({'_id': ObjectId(r['doctor_id'])}) if r.get('doctor_id') else None
+    analysis = db.analyses.find_one({'_id': ObjectId(r['analysis_id'])}) if r.get('analysis_id') else None
+    return {
+        'id': str(r['_id']),
+        'user_name': user.get('name', '') if user else '',
+        'doctor_name': doctor.get('name', '') if doctor else '',
+        'disease': analysis.get('prediction') if analysis else None,
+        'type': r.get('type'),
+        'status': r.get('status'),
+        'time_slot': r['time_slot'].isoformat() if r.get('time_slot') else None,
+        'payment_id': r.get('payment_id'),
+    }
+
 
 @consult_bp.route('/requests', methods=['GET'])
 @jwt_required()
 def get_requests():
-    current_user = get_jwt_identity()
-    if current_user['role'] == 'doctor':
-        # Doctor sees pending requests assigned to them
-        requests = Consultation.query.filter_by(doctor_id=current_user['id']).all()
+    current_user = get_current_user_identity()
+    if not current_user:
+        return jsonify({'msg': 'Invalid token'}), 401
+    db = get_db()
+    if current_user.get('role') == 'doctor':
+        cursor = db.consultations.find({'doctor_id': current_user['id']})
     else:
-        # User sees their own requests
-        requests = Consultation.query.filter_by(user_id=current_user['id']).all()
-
-    result = []
-    for r in requests:
-        user = User.query.get(r.user_id)
-        doctor = User.query.get(r.doctor_id)
-        analysis = Analysis.query.get(r.analysis_id)
-        result.append({
-            'id': r.id,
-            'user_name': user.name,
-            'doctor_name': doctor.name,
-            'disease': analysis.prediction if analysis else None,
-            'type': r.type,
-            'status': r.status,
-            'time_slot': r.time_slot.isoformat() if r.time_slot else None,
-            'payment_id': r.payment_id
-        })
+        cursor = db.consultations.find({'user_id': current_user['id']})
+    result = [_serialize_consultation(r, db) for r in cursor]
     return jsonify(result)
 
-@consult_bp.route('/respond/<int:consult_id>', methods=['POST'])
+
+@consult_bp.route('/respond/<consult_id>', methods=['POST'])
 @jwt_required()
 def respond_to_request(consult_id):
-    current_user = get_jwt_identity()
-    if current_user['role'] != 'doctor':
+    current_user = get_current_user_identity()
+    if not current_user or current_user.get('role') != 'doctor':
         return jsonify({'msg': 'Unauthorized'}), 403
 
-    data = request.get_json()
-    action = data.get('action')  # 'accept' or 'reject'
+    data = request.get_json() or {}
+    action = (data.get('action') or '').strip().lower()
     time_slot = data.get('time_slot') if action == 'accept' else None
 
-    consultation = Consultation.query.get_or_404(consult_id)
-    if consultation.doctor_id != current_user['id']:
+    db = get_db()
+    try:
+        cid = ObjectId(consult_id)
+    except Exception:
+        return jsonify({'msg': 'Invalid consultation'}), 404
+    consultation = db.consultations.find_one({'_id': cid})
+    if not consultation:
+        return jsonify({'msg': 'Not found'}), 404
+    if str(consultation.get('doctor_id')) != str(current_user.get('id')):
         return jsonify({'msg': 'Not your request'}), 403
 
     if action == 'accept':
-        consultation.status = 'accepted'
-        consultation.time_slot = datetime.fromisoformat(time_slot) if time_slot else None
-        db.session.commit()
-        # Notify user
-        user = User.query.get(consultation.user_id)
-        doctor = User.query.get(consultation.doctor_id)
-        subject = "Consultation Request Accepted"
-        body = f"""
-        <p>Dear {user.name},</p>
-        <p>Dr. {doctor.name} has accepted your consultation request.</p>
-        <p><strong>Type:</strong> {consultation.type}<br>
-        <strong>Scheduled time:</strong> {time_slot}</p>
-        <p>Please proceed to payment on your dashboard.</p>
-        """
-        send_email(user.email, subject, body)
+        update = {'status': 'accepted'}
+        if time_slot:
+            try:
+                update['time_slot'] = datetime.fromisoformat(time_slot.replace('Z', '+00:00'))
+            except Exception:
+                update['time_slot'] = None
+        db.consultations.update_one({'_id': cid}, {'$set': update})
+        user = db.users.find_one({'_id': ObjectId(consultation['user_id'])})
+        doctor = db.users.find_one({'_id': ObjectId(consultation['doctor_id'])})
+        if user and current_app.config.get('MAIL_USERNAME'):
+            subject = "Consultation Request Accepted"
+            body = f"""
+            <p>Dear {user.get('name', '')},</p>
+            <p>Dr. {doctor.get('name', '')} has accepted your consultation request.</p>
+            <p><strong>Type:</strong> {consultation.get('type', '')}<br>
+            <strong>Scheduled time:</strong> {time_slot}</p>
+            <p>Please proceed to payment on your dashboard.</p>
+            """
+            send_email(user.get('email', ''), subject, body)
     elif action == 'reject':
-        consultation.status = 'rejected'
-        db.session.commit()
-        user = User.query.get(consultation.user_id)
-        doctor = User.query.get(consultation.doctor_id)
-        subject = "Consultation Request Rejected"
-        body = f"Dear {user.name}, Dr. {doctor.name} has rejected your consultation request."
-        send_email(user.email, subject, body)
+        db.consultations.update_one({'_id': cid}, {'$set': {'status': 'rejected'}})
+        user = db.users.find_one({'_id': ObjectId(consultation['user_id'])})
+        doctor = db.users.find_one({'_id': ObjectId(consultation['doctor_id'])})
+        if user and current_app.config.get('MAIL_USERNAME'):
+            subject = "Consultation Request Rejected"
+            body = f"Dear {user.get('name', '')}, Dr. {doctor.get('name', '')} has rejected your consultation request."
+            send_email(user.get('email', ''), subject, body)
     else:
         return jsonify({'msg': 'Invalid action'}), 400
 
     return jsonify({'msg': 'Response recorded'})
 
+
 @consult_bp.route('/create-order', methods=['POST'])
 @jwt_required()
 def create_order():
-    data = request.get_json()
+    if not razorpay_client:
+        return jsonify({'msg': 'Payment not configured'}), 503
+    data = request.get_json() or {}
     consultation_id = data.get('consultation_id')
-    consultation = Consultation.query.get_or_404(consultation_id)
+    if not consultation_id:
+        return jsonify({'msg': 'consultation_id required'}), 400
 
-    # Verify user owns this consultation
-    if consultation.user_id != get_jwt_identity()['id']:
+    db = get_db()
+    try:
+        cid = ObjectId(consultation_id)
+    except Exception:
+        return jsonify({'msg': 'Invalid consultation'}), 404
+    consultation = db.consultations.find_one({'_id': cid})
+    identity = get_current_user_identity()
+    if not identity or not consultation or str(consultation.get('user_id')) != str(identity.get('id')):
         return jsonify({'msg': 'Unauthorized'}), 403
 
-    # Amount based on consultation type (in paise)
-    amount_map = {'chat': 30000, 'call': 50000, 'video': 100000}  # ₹300, ₹500, ₹1000
-    amount = amount_map.get(consultation.type, 30000)
-
-    # Create Razorpay order
+    amount_map = {'chat': 30000, 'call': 50000, 'video': 100000}
+    amount = amount_map.get(consultation.get('type'), 30000)
     order_data = {
         'amount': amount,
         'currency': 'INR',
@@ -164,23 +207,27 @@ def create_order():
         'payment_capture': 1
     }
     order = razorpay_client.order.create(order_data)
-
     return jsonify({
         'order_id': order['id'],
         'amount': amount,
         'key_id': current_app.config['RAZORPAY_KEY_ID']
     })
 
+
 @consult_bp.route('/verify-payment', methods=['POST'])
 @jwt_required()
 def verify_payment():
-    data = request.get_json()
+    if not razorpay_client:
+        return jsonify({'msg': 'Payment not configured'}), 503
+    data = request.get_json() or {}
     consultation_id = data.get('consultation_id')
     payment_id = data.get('payment_id')
     order_id = data.get('order_id')
     signature = data.get('signature')
 
-    # Verify signature (optional but recommended)
+    if not all([consultation_id, payment_id, order_id, signature]):
+        return jsonify({'msg': 'Missing payment data'}), 400
+
     params_dict = {
         'razorpay_order_id': order_id,
         'razorpay_payment_id': payment_id,
@@ -188,31 +235,34 @@ def verify_payment():
     }
     try:
         razorpay_client.utility.verify_payment_signature(params_dict)
-    except:
+    except Exception:
         return jsonify({'msg': 'Payment verification failed'}), 400
 
-    consultation = Consultation.query.get(consultation_id)
-    consultation.status = 'paid'
-    consultation.payment_id = payment_id
-    db.session.commit()
-
-    # Notify both parties
-    user = User.query.get(consultation.user_id)
-    doctor = User.query.get(consultation.doctor_id)
-    subject = "Payment Successful - Consultation Confirmed"
-    body = f"""
-    <p>Dear {user.name},</p>
-    <p>Your payment for consultation with Dr. {doctor.name} has been received.</p>
-    <p>Consultation details:</p>
-    <ul>
-        <li>Type: {consultation.type}</li>
-        <li>Time: {consultation.time_slot}</li>
-    </ul>
-    <p>Please log in to start the consultation.</p>
-    """
-    send_email(user.email, subject, body)
-
-    doctor_body = f"Dear Dr. {doctor.name}, {user.name} has completed payment for your consultation."
-    send_email(doctor.email, subject, doctor_body)
+    db = get_db()
+    try:
+        cid = ObjectId(consultation_id)
+    except Exception:
+        return jsonify({'msg': 'Invalid consultation'}), 400
+    db.consultations.update_one(
+        {'_id': cid},
+        {'$set': {'status': 'paid', 'payment_id': payment_id}}
+    )
+    consultation = db.consultations.find_one({'_id': cid})
+    user = db.users.find_one({'_id': ObjectId(consultation['user_id'])}) if consultation else None
+    doctor = db.users.find_one({'_id': ObjectId(consultation['doctor_id'])}) if consultation else None
+    if user and doctor and current_app.config.get('MAIL_USERNAME'):
+        subject = "Payment Successful - Consultation Confirmed"
+        body = f"""
+        <p>Dear {user.get('name', '')},</p>
+        <p>Your payment for consultation with Dr. {doctor.get('name', '')} has been received.</p>
+        <p>Consultation details:</p>
+        <ul>
+            <li>Type: {consultation.get('type', '')}</li>
+            <li>Time: {consultation.get('time_slot')}</li>
+        </ul>
+        <p>Please log in to start the consultation.</p>
+        """
+        send_email(user.get('email', ''), subject, body)
+        send_email(doctor.get('email', ''), subject, f"Dear Dr. {doctor.get('name', '')}, {user.get('name', '')} has completed payment for your consultation.")
 
     return jsonify({'msg': 'Payment verified and consultation confirmed'})

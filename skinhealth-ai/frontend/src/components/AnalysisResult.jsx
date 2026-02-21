@@ -26,9 +26,9 @@ export default function AnalysisResult() {
       <h1 className="text-3xl font-bold mb-4">Analysis Result</h1>
       <div className="grid md:grid-cols-2 gap-6">
         <div>
-          <img src={`http://localhost:5000/uploads/${analysis.image}`} alt="Uploaded" className="w-full rounded shadow" />
+          <img src={`/uploads/${analysis.image || ''}`} alt="Uploaded" className="w-full rounded shadow" />
           {analysis.heatmap && (
-            <img src={`http://localhost:5000/uploads/${analysis.heatmap}`} alt="Heatmap" className="w-full rounded shadow mt-4" />
+            <img src={`/uploads/${analysis.heatmap}`} alt="Heatmap" className="w-full rounded shadow mt-4" />
           )}
         </div>
         <div>

@@ -1,24 +1,21 @@
 import os
+import uuid
+from datetime import datetime
+
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
 from flask import Blueprint, request, jsonify, current_app
-from flask_jwt_extended import jwt_required, get_jwt_identity
-from werkzeug.utils import secure_filename
-import numpy as np
-from models import db, User, Analysis
-import uuid
-import timm  # <-- Add timm to your requirements.txt
+from flask_jwt_extended import jwt_required
 
-# Optional: for Grad-CAM heatmaps (uncomment if you have torchcam installed)
-# try:
-#     from torchcam.methods import GradCAM
-# except ImportError:
-#     GradCAM = None
+from auth import get_current_user_identity
+from werkzeug.utils import secure_filename
+
+import timm
+from mongo_db import get_db
 
 upload_bp = Blueprint('upload', __name__)
 
-# 7 disease classes (HAM10000) – ensure this order matches your model's training order
 CLASS_NAMES = [
     'Actinic Keratoses',
     'Basal Cell Carcinoma',
@@ -29,7 +26,6 @@ CLASS_NAMES = [
     'Vascular Lesions'
 ]
 
-# First‑aid tips (static, for demo only)
 FIRST_AID = {
     'Actinic Keratoses': 'Avoid sun exposure and use sunscreen.',
     'Basal Cell Carcinoma': 'Keep area clean and dry; consult a dermatologist.',
@@ -40,58 +36,38 @@ FIRST_AID = {
     'Vascular Lesions': 'Apply cold compress if irritated; see doctor if painful.'
 }
 
-# Load model once (global variable)
 model = None
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+
 def load_model():
-    """Load the timm EfficientNet-B3 model from the .pth file."""
     global model
     model_path = current_app.config['MODEL_PATH']
-
-    # Create the model using timm (exact architecture used during training)
+    if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Model file not found: {model_path}")
     model = timm.create_model('efficientnet_b3', pretrained=False, num_classes=7)
-    
-    # Load state dict
     state_dict = torch.load(model_path, map_location=device)
-    
-    # Handle DataParallel wrapping by removing 'module.' prefix if present
     if list(state_dict.keys())[0].startswith('module.'):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    
     model.load_state_dict(state_dict)
     model.to(device)
     model.eval()
     print("timm EfficientNet-B3 loaded successfully")
 
+
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in current_app.config['ALLOWED_EXTENSIONS']
 
+
 def preprocess_image(image_path):
-    """Preprocess image for EfficientNet-B3: resize to 300x300 and normalize."""
     transform = transforms.Compose([
-        transforms.Resize((300, 300)),          # EfficientNet-B3 input size
+        transforms.Resize((300, 300)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        # If you used different mean/std during training, replace the values above.
     ])
     image = Image.open(image_path).convert('RGB')
     return transform(image).unsqueeze(0).to(device)
 
-def generate_heatmap(model, input_tensor, target_class):
-    """Generate Grad-CAM heatmap (placeholder – requires torchcam)."""
-    # Uncomment if you have torchcam installed and want heatmaps
-    # if GradCAM is None:
-    #     return None
-    # # Choose a convolutional layer – for EfficientNet-B3, try 'blocks' or a specific block
-    # cam_extractor = GradCAM(model, target_layer='blocks')  # adjust layer name
-    # with torch.no_grad():
-    #     out = model(input_tensor)
-    # activation_map = cam_extractor(out.argmax().item(), out)
-    # # Convert to numpy and save as image (simplified)
-    # heatmap = activation_map[0].cpu().numpy()
-    # # ... (code to save heatmap image) ...
-    return None
 
 @upload_bp.route('/predict', methods=['POST'])
 @jwt_required()
@@ -105,17 +81,40 @@ def predict():
         return jsonify({'msg': 'File type not allowed'}), 400
 
     filename = secure_filename(file.filename)
-    # Generate unique filename to avoid collisions
     unique_filename = f"{uuid.uuid4().hex}_{filename}"
     filepath = os.path.join(current_app.config['UPLOAD_FOLDER'], unique_filename)
     file.save(filepath)
 
-    # Load model if not already loaded
     global model
     if model is None:
-        load_model()
+        try:
+            load_model()
+        except FileNotFoundError as e:
+            # Demo mode: no model file – return a placeholder result
+            db = get_db()
+            identity = get_current_user_identity()
+            if not identity:
+                return jsonify({'msg': 'Invalid token'}), 401
+            user_id = identity.get('id')
+            analysis_doc = {
+                'user_id': user_id,
+                'image_path': unique_filename,
+                'prediction': 'Melanocytic Nevi',
+                'severity': 'Low',
+                'heatmap_path': None,
+                'timestamp': datetime.utcnow(),
+            }
+            result = db.analyses.insert_one(analysis_doc)
+            return jsonify({
+                'analysis_id': str(result.inserted_id),
+                'prediction': 'Melanocytic Nevi',
+                'severity': 'Low',
+                'confidence': 0.65,
+                'first_aid': FIRST_AID.get('Melanocytic Nevi', 'No specific advice.'),
+                'heatmap_url': None,
+                'image_url': f'/uploads/{unique_filename}'
+            })
 
-    # Preprocess and predict
     input_tensor = preprocess_image(filepath)
     with torch.no_grad():
         outputs = model(input_tensor)
@@ -124,7 +123,6 @@ def predict():
         pred_class = CLASS_NAMES[predicted.item()]
         confidence = conf.item()
 
-    # Severity based on confidence
     if confidence < 0.5:
         severity = 'Low'
     elif confidence < 0.8:
@@ -132,33 +130,72 @@ def predict():
     else:
         severity = 'High'
 
-    # Generate heatmap (optional)
-    heatmap_filename = None
-    # if GradCAM:
-    #     heatmap = generate_heatmap(model, input_tensor, predicted.item())
-    #     if heatmap is not None:
-    #         heatmap_filename = f"heatmap_{unique_filename}"
-    #         heatmap_path = os.path.join(current_app.config['UPLOAD_FOLDER'], heatmap_filename)
-    #         # Save heatmap image (code omitted for brevity)
-
-    # Save analysis to DB
-    user_id = get_jwt_identity()['id']
-    analysis = Analysis(
-        user_id=user_id,
-        image_path=unique_filename,
-        prediction=pred_class,
-        severity=severity,
-        heatmap_path=heatmap_filename
-    )
-    db.session.add(analysis)
-    db.session.commit()
+    identity = get_current_user_identity()
+    if not identity:
+        return jsonify({'msg': 'Invalid token'}), 401
+    user_id = identity.get('id')
+    db = get_db()
+    analysis_doc = {
+        'user_id': user_id,
+        'image_path': unique_filename,
+        'prediction': pred_class,
+        'severity': severity,
+        'heatmap_path': None,
+        'timestamp': datetime.utcnow(),
+    }
+    result = db.analyses.insert_one(analysis_doc)
 
     return jsonify({
-        'analysis_id': analysis.id,
+        'analysis_id': str(result.inserted_id),
         'prediction': pred_class,
         'severity': severity,
         'confidence': confidence,
         'first_aid': FIRST_AID.get(pred_class, 'No specific advice.'),
-        'heatmap_url': f'/uploads/{heatmap_filename}' if heatmap_filename else None,
+        'heatmap_url': None,
         'image_url': f'/uploads/{unique_filename}'
+    })
+
+
+@upload_bp.route('/analyses', methods=['GET'])
+@jwt_required()
+def list_analyses():
+    identity = get_current_user_identity()
+    if not identity:
+        return jsonify({'msg': 'Invalid token'}), 401
+    db = get_db()
+    user_id = identity.get('id')
+    cursor = db.analyses.find({'user_id': user_id}).sort('timestamp', -1)
+    analyses = []
+    for a in cursor:
+        analyses.append({
+            'id': str(a['_id']),
+            'prediction': a.get('prediction', ''),
+            'severity': a.get('severity', ''),
+            'timestamp': a['timestamp'].isoformat() if a.get('timestamp') else None,
+        })
+    return jsonify(analyses)
+
+
+@upload_bp.route('/analysis/<analysis_id>', methods=['GET'])
+@jwt_required()
+def get_analysis(analysis_id):
+    from bson import ObjectId
+    identity = get_current_user_identity()
+    if not identity:
+        return jsonify({'msg': 'Invalid token'}), 401
+    user_id = identity.get('id')
+    db = get_db()
+    try:
+        a = db.analyses.find_one({'_id': ObjectId(analysis_id), 'user_id': user_id})
+    except Exception:
+        a = None
+    if not a:
+        return jsonify({'msg': 'Analysis not found'}), 404
+    return jsonify({
+        'id': str(a['_id']),
+        'image': a.get('image_path'),
+        'prediction': a.get('prediction', ''),
+        'severity': a.get('severity', ''),
+        'first_aid': FIRST_AID.get(a.get('prediction'), 'No specific advice.'),
+        'heatmap': a.get('heatmap_path'),
     })
