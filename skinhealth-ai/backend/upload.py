@@ -26,6 +26,23 @@ except ImportError:
 
 upload_bp = Blueprint('upload', __name__)
 
+
+def _get_optional_identity():
+    """Return current user from JWT if present; None if no token or invalid."""
+    try:
+        from flask_jwt_extended import get_jwt_identity
+        identity = get_jwt_identity()
+        if identity is None:
+            return None
+        if isinstance(identity, dict):
+            return identity
+        if isinstance(identity, str):
+            import json
+            return json.loads(identity)
+        return None
+    except Exception:
+        return None
+
 CLASS_NAMES = [
     'Actinic Keratoses',
     'Basal Cell Carcinoma',
@@ -116,7 +133,7 @@ def generate_gradcam_heatmap(model, input_tensor, target_class_idx, save_path, s
 
 
 @upload_bp.route('/predict', methods=['POST'])
-@jwt_required()
+@jwt_required(optional=True)
 def predict():
     if 'image' not in request.files:
         return jsonify({'msg': 'No image part'}), 400
@@ -136,29 +153,41 @@ def predict():
         try:
             load_model()
         except FileNotFoundError as e:
-            # Demo mode: no model file – return a placeholder result
-            db = get_db()
-            identity = get_current_user_identity()
-            if not identity:
-                return jsonify({'msg': 'Invalid token'}), 401
-            user_id = identity.get('id')
-            analysis_doc = {
-                'user_id': user_id,
-                'image_path': unique_filename,
-                'prediction': 'Melanocytic Nevi',
-                'severity': 'Low',
-                'heatmap_path': None,
-                'timestamp': datetime.utcnow(),
-            }
-            result = db.analyses.insert_one(analysis_doc)
+            # Demo mode: no model file – return a placeholder result (save to DB only if logged in)
+            identity = _get_optional_identity()
+            analysis_id = None
+            if identity:
+                db = get_db()
+                user_id = identity.get('id')
+                analysis_doc = {
+                    'user_id': user_id,
+                    'image_path': unique_filename,
+                    'prediction': 'Melanocytic Nevi',
+                    'severity': 'Low',
+                    'heatmap_path': None,
+                    'timestamp': datetime.utcnow(),
+                }
+                result = db.analyses.insert_one(analysis_doc)
+                analysis_id = str(result.inserted_id)
+            all_classes = [
+                {'label': 'Melanocytic Nevi', 'score': 94.2},
+                {'label': 'Benign Keratosis', 'score': 2.8},
+                {'label': 'Dermatofibroma', 'score': 1.1},
+                {'label': 'Basal Cell Carcinoma', 'score': 0.9},
+                {'label': 'Vascular Lesions', 'score': 0.5},
+                {'label': 'Actinic Keratoses', 'score': 0.3},
+                {'label': 'Melanoma', 'score': 0.2},
+            ]
             return jsonify({
-                'analysis_id': str(result.inserted_id),
+                'analysis_id': analysis_id,
                 'prediction': 'Melanocytic Nevi',
                 'severity': 'Low',
-                'confidence': 0.65,
+                'confidence': 65.0,
+                'all_classes': all_classes,
                 'first_aid': FIRST_AID.get('Melanocytic Nevi', 'No specific advice.'),
                 'heatmap_url': None,
-                'image_url': f'/uploads/{unique_filename}'
+                'image_url': f'/uploads/{unique_filename}',
+                'demo': True,
             })
 
     input_tensor = preprocess_image(filepath)
@@ -172,7 +201,7 @@ def predict():
     if confidence < 0.5:
         severity = 'Low'
     elif confidence < 0.8:
-        severity = 'Medium'
+        severity = 'Moderate'
     else:
         severity = 'High'
 
@@ -187,30 +216,40 @@ def predict():
     except Exception as e:
         print(f"Heatmap generation skipped: {e}")
 
-    identity = get_current_user_identity()
-    if not identity:
-        return jsonify({'msg': 'Invalid token'}), 401
-    user_id = identity.get('id')
-    db = get_db()
-    analysis_doc = {
-        'user_id': user_id,
-        'image_path': unique_filename,
-        'prediction': pred_class,
-        'severity': severity,
-        'confidence': confidence,
-        'heatmap_path': heatmap_filename,
-        'timestamp': datetime.utcnow(),
-    }
-    result = db.analyses.insert_one(analysis_doc)
+    identity = _get_optional_identity()
+    analysis_id = None
+    if identity:
+        db = get_db()
+        user_id = identity.get('id')
+        analysis_doc = {
+            'user_id': user_id,
+            'image_path': unique_filename,
+            'prediction': pred_class,
+            'severity': severity,
+            'confidence': confidence,
+            'heatmap_path': heatmap_filename,
+            'timestamp': datetime.utcnow(),
+        }
+        result = db.analyses.insert_one(analysis_doc)
+        analysis_id = str(result.inserted_id)
+
+    # All 7 class scores (0-100) for frontend chart, sorted by score desc
+    probs = probabilities[0].tolist()
+    all_classes = sorted(
+        [{'label': CLASS_NAMES[i], 'score': round(probs[i] * 100, 1)} for i in range(len(CLASS_NAMES))],
+        key=lambda x: -x['score']
+    )
 
     return jsonify({
-        'analysis_id': str(result.inserted_id),
+        'analysis_id': analysis_id,
         'prediction': pred_class,
         'severity': severity,
-        'confidence': confidence,
+        'confidence': round(confidence * 100, 1),
+        'all_classes': all_classes,
         'first_aid': FIRST_AID.get(pred_class, 'No specific advice.'),
         'heatmap_url': f'/uploads/{heatmap_filename}' if heatmap_filename else None,
-        'image_url': f'/uploads/{unique_filename}'
+        'image_url': f'/uploads/{unique_filename}',
+        'demo': False,
     })
 
 

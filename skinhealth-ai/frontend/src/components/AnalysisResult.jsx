@@ -1,9 +1,8 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import Navbar from "../components/Navbar";
 import ConfidenceRing from "../components/ConfidenceRing";
-import DiseaseTabs from "../components/DiseaseTabs";
-import HeatmapViewer from "../components/HeatmapViewer";
-import SymptomChecker from "../components/SymptomChecker";
+import DiseaseTabs from "../components/Diseasetabs";
+import HeatmapViewer from "../components/Heatmapviewer";
 
 const MOCK_RESULT = {
   disease: "Melanocytic Nevi",
@@ -108,16 +107,13 @@ function AnalysisLoadingScreen() {
   const [step, setStep] = useState(0);
   const [pct, setPct] = useState(0);
 
-  useState(() => {
+  useEffect(() => {
     const iv = setInterval(() => {
-      setPct(p => {
-        if (p >= 100) { clearInterval(iv); return 100; }
-        return p + 2;
-      });
+      setPct((p) => (p >= 100 ? 100 : p + 2));
     }, 60);
-    const sv = setInterval(() => setStep(s => Math.min(s + 1, steps.length - 1)), 600);
+    const sv = setInterval(() => setStep((s) => Math.min(s + 1, steps.length - 1)), 600);
     return () => { clearInterval(iv); clearInterval(sv); };
-  });
+  }, []);
 
   return (
     <div style={{

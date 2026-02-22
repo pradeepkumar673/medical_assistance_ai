@@ -1,26 +1,26 @@
-import { useState, useRef, useCallback } from "react";
+import { useState, useRef, useCallback, useEffect } from "react";
 import Navbar from "../components/Navbar";
 import ConfidenceRing from "../components/ConfidenceRing";
-import DiseaseTabs from "../components/DiseaseTabs";
-import HeatmapViewer from "../components/HeatmapViewer";
-import SymptomChecker from "../components/SymptomChecker";
+import DiseaseTabs from "../components/Diseasetabs";
+import HeatmapViewer from "../components/Heatmapviewer";
+import api from "../services/api";
 
-const MOCK_RESULT = {
-  disease: "Melanocytic Nevi",
-  confidence: 94.2,
-  severity: "Low",
-  urgency: "Monitor",
-  heatmapAvailable: true,
-  allClasses: [
-    { label: "Melanocytic Nevi", score: 94.2 },
-    { label: "Benign Keratosis", score: 2.8 },
-    { label: "Dermatofibroma", score: 1.1 },
-    { label: "Basal Cell Carcinoma", score: 0.9 },
-    { label: "Vascular Lesion", score: 0.5 },
-    { label: "Actinic Keratosis", score: 0.3 },
-    { label: "Melanoma", score: 0.2 },
-  ],
-};
+function mapApiToResult(apiData) {
+  const severity = apiData.severity === "Medium" ? "Moderate" : (apiData.severity || "Low");
+  return {
+    disease: apiData.prediction || "Unknown",
+    confidence: typeof apiData.confidence === "number" ? apiData.confidence : Number(apiData.confidence) || 0,
+    severity,
+    urgency: severity === "High" ? "Urgent" : "Monitor",
+    heatmapAvailable: Boolean(apiData.heatmap_url),
+    heatmapUrl: apiData.heatmap_url || null,
+    imageUrl: apiData.image_url || null,
+    demo: Boolean(apiData.demo),
+    allClasses: Array.isArray(apiData.all_classes) && apiData.all_classes.length
+      ? apiData.all_classes
+      : [{ label: apiData.prediction || "Unknown", score: apiData.confidence || 0 }],
+  };
+}
 
 const SEVERITY_CONFIG = {
   Low:      { color: "#10b981", bg: "#d1fae5", icon: "✅", label: "Low Risk" },
@@ -108,16 +108,16 @@ function AnalysisLoadingScreen() {
   const [step, setStep] = useState(0);
   const [pct, setPct] = useState(0);
 
-  useState(() => {
+  useEffect(() => {
     const iv = setInterval(() => {
-      setPct(p => {
-        if (p >= 100) { clearInterval(iv); return 100; }
+      setPct((p) => {
+        if (p >= 100) return 100;
         return p + 2;
       });
     }, 60);
-    const sv = setInterval(() => setStep(s => Math.min(s + 1, steps.length - 1)), 600);
+    const sv = setInterval(() => setStep((s) => Math.min(s + 1, steps.length - 1)), 600);
     return () => { clearInterval(iv); clearInterval(sv); };
-  });
+  }, []);
 
   return (
     <div style={{
@@ -270,6 +270,11 @@ function ResultsPanel({ result, imageUrl, navigate }) {
             <span style={{ background: "rgba(255,255,255,0.15)", color: "rgba(255,255,255,0.85)", padding: "3px 10px", borderRadius: 100, fontSize: 12, fontFamily: "'DM Mono', monospace" }}>
               {result.confidence}% confidence
             </span>
+            {result.demo && (
+              <span style={{ background: "rgba(255,200,0,0.3)", color: "#fff", padding: "3px 10px", borderRadius: 100, fontSize: 12 }}>
+                Demo (model not loaded)
+              </span>
+            )}
           </div>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
@@ -337,9 +342,12 @@ export default function AnalysisPage({ navigate }) {
   const [analyzing, setAnalyzing] = useState(false);
   const [result, setResult] = useState(null);
 
+  const [analyzeError, setAnalyzeError] = useState(null);
+
   const handleFileSelect = (f) => {
-    if (!f) { setFile(null); setPreview(null); setResult(null); return; }
+    if (!f) { setFile(null); setPreview(null); setResult(null); setAnalyzeError(null); return; }
     setFile(f);
+    setAnalyzeError(null);
     const reader = new FileReader();
     reader.onload = e => setPreview(e.target.result);
     reader.readAsDataURL(f);
@@ -347,11 +355,22 @@ export default function AnalysisPage({ navigate }) {
   };
 
   const handleAnalyze = async () => {
+    if (!file) return;
     setAnalyzing(true);
-    // Simulate API call to /api/predict
-    await new Promise(r => setTimeout(r, 3200));
-    setAnalyzing(false);
-    setResult(MOCK_RESULT);
+    setAnalyzeError(null);
+    const formData = new FormData();
+    formData.append("image", file);
+    try {
+      const res = await api.post("/api/predict", formData, {
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+      setResult(mapApiToResult(res.data));
+    } catch (err) {
+      const msg = err.response?.data?.msg || err.message || "Analysis failed";
+      setAnalyzeError(msg);
+    } finally {
+      setAnalyzing(false);
+    }
   };
 
   return (
@@ -378,10 +397,15 @@ export default function AnalysisPage({ navigate }) {
             <UploadZone onFileSelect={handleFileSelect} file={file} preview={preview} />
 
             {preview && !analyzing && (
-              <div style={{ marginTop: 20, display: "flex", justifyContent: "center" }}>
+              <div style={{ marginTop: 20, display: "flex", flexDirection: "column", alignItems: "center", gap: 12 }}>
                 <button className="btn-primary" onClick={handleAnalyze} style={{ fontSize: 16, padding: "16px 48px" }}>
                   🔬 Analyze Now
                 </button>
+                {analyzeError && (
+                  <p style={{ color: "var(--red-500, #ef4444)", fontSize: 14, textAlign: "center", maxWidth: 400 }}>
+                    {analyzeError}
+                  </p>
+                )}
               </div>
             )}
 
